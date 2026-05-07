@@ -116,6 +116,7 @@ export async function ensureChatSchema(db) {
     `ALTER TABLE chat_messages ADD COLUMN reply_to_snippet TEXT`,
     `ALTER TABLE chat_messages ADD COLUMN edited INTEGER DEFAULT 0`,
     `ALTER TABLE chat_messages ADD COLUMN deleted INTEGER DEFAULT 0`,
+    `ALTER TABLE chat_messages ADD COLUMN mentions TEXT`,
   ];
   for (const sql of alters) {
     try { await db.prepare(sql).run(); } catch(e) {}

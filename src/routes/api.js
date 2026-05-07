@@ -39,6 +39,31 @@ function divSlug(division) {
   return (division || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
+async function sendPushToUsers(env, userIds, { title, body, data }) {
+  if (!env.DB || !userIds?.length) return;
+  try {
+    const placeholders = userIds.map(() => "?").join(",");
+    const { results: tokens } = await env.DB.prepare(
+      `SELECT token FROM push_tokens WHERE user_id IN (${placeholders})`
+    ).bind(...userIds).all();
+    if (!tokens?.length) return;
+    const messages = tokens.map(t => ({
+      to: t.token,
+      title: title || "",
+      body: body || "",
+      data: data || {},
+      sound: "default",
+    }));
+    await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify(messages),
+    });
+  } catch (e) {
+    // best-effort; don't fail the request because push failed
+  }
+}
+
 async function checkChannelAccess(env, session, channelId) {
   if (session.role === "superadmin" || session.role === "admin") return true;
   const teamIds = session.teamIds || [];
@@ -440,7 +465,7 @@ export async function handleApiRoutes(request, env, url, ctx) {
         // Top-level only — thread replies live in their thread
         const { results: messages } = await env.DB.prepare(
           `SELECT m.id, m.user_id, m.content, m.created_at, m.display_name, m.team_id, m.team_name, m.primary_color,
-                  m.reply_to_id, m.reply_to_snippet, m.edited, m.deleted,
+                  m.reply_to_id, m.reply_to_snippet, m.mentions, m.edited, m.deleted,
                   u.first_name, u.last_name, u.avatar_url
            FROM chat_messages m LEFT JOIN users u ON u.id = m.user_id
            WHERE m.room_id = ? AND m.reply_to_id IS NULL${beforeId ? " AND m.id < ?" : ""}
@@ -486,6 +511,7 @@ export async function handleApiRoutes(request, env, url, ctx) {
             replyToSnippet: m.reply_to_snippet || null,
             replyCount: threadCounts[m.id]?.count || 0,
             lastReplyAt: threadCounts[m.id]?.lastReplyAt || null,
+            mentions: m.mentions ? JSON.parse(m.mentions) : [],
             createdAt: m.created_at,
             reactions: m.deleted ? [] : Object.entries(reactionsByMsg[m.id] || {}).map(([emoji, d]) => ({ emoji, count: d.count, mine: d.mine })),
           })),
@@ -515,7 +541,6 @@ export async function handleApiRoutes(request, env, url, ctx) {
             }
           }
         }
-        // Handle reply
         let replyToId = null, replyToSnippet = null;
         if (body.replyToId) {
           replyToId = parseInt(body.replyToId);
@@ -524,10 +549,24 @@ export async function handleApiRoutes(request, env, url, ctx) {
             replyToSnippet = (replyMsg.display_name || "Unknown") + ": " + (replyMsg.content || "").slice(0, 100);
           }
         }
+        const mentions = Array.isArray(body.mentions) ? body.mentions.filter(x => typeof x === "string") : [];
+        const mentionsJson = mentions.length ? JSON.stringify(mentions) : null;
         const now = Date.now();
         const result = await env.DB.prepare(
-          `INSERT INTO chat_messages (room_id, user_id, content, display_name, team_id, team_name, primary_color, reply_to_id, reply_to_snippet, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(channelId, session.userId, content, displayName, msgTeamId, msgTeamName, msgColor, replyToId, replyToSnippet, now).run();
+          `INSERT INTO chat_messages (room_id, user_id, content, display_name, team_id, team_name, primary_color, reply_to_id, reply_to_snippet, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(channelId, session.userId, content, displayName, msgTeamId, msgTeamName, msgColor, replyToId, replyToSnippet, mentionsJson, now).run();
+
+        // Push notifications to mentioned users (excluding sender)
+        const recipients = mentions.filter(uid => uid && uid !== session.userId);
+        if (recipients.length) {
+          const channel = await env.DB.prepare(`SELECT name, type FROM chat_rooms WHERE id = ?`).bind(channelId).first();
+          const channelLabel = channel?.type === "dm" ? "DM" : "#" + (channel?.name || "channel");
+          await sendPushToUsers(env, recipients, {
+            title: `${displayName} in ${channelLabel}`,
+            body: content.slice(0, 140),
+            data: { channelId, messageId: result.meta.last_row_id, type: "mention" },
+          });
+        }
         return json({ id: result.meta.last_row_id, createdAt: now });
       }
     }
@@ -540,7 +579,7 @@ export async function handleApiRoutes(request, env, url, ctx) {
       if (!await checkChannelAccess(env, session, channelId)) return err("Forbidden", "forbidden", 403);
       const { results: rows } = await env.DB.prepare(
         `SELECT m.id, m.user_id, m.content, m.created_at, m.display_name, m.team_id, m.team_name, m.primary_color,
-                m.reply_to_id, m.edited, m.deleted, u.first_name, u.last_name, u.avatar_url
+                m.reply_to_id, m.mentions, m.edited, m.deleted, u.first_name, u.last_name, u.avatar_url
          FROM chat_messages m LEFT JOIN users u ON u.id = m.user_id
          WHERE m.room_id = ? AND (m.id = ? OR m.reply_to_id = ?)
          ORDER BY m.id ASC`
@@ -571,6 +610,7 @@ export async function handleApiRoutes(request, env, url, ctx) {
           deleted: !!m.deleted,
           edited: !!m.edited,
           replyToId: m.reply_to_id || null,
+          mentions: m.mentions ? JSON.parse(m.mentions) : [],
           createdAt: m.created_at,
           reactions: m.deleted ? [] : Object.entries(reactionsByMsg[m.id] || {}).map(([emoji, d]) => ({ emoji, count: d.count, mine: d.mine })),
         })),
