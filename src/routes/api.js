@@ -437,25 +437,34 @@ export async function handleApiRoutes(request, env, url, ctx) {
       if (request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 100);
         const beforeId = url.searchParams.get("before") ? parseInt(url.searchParams.get("before")) : null;
+        // Top-level only — thread replies live in their thread
         const { results: messages } = await env.DB.prepare(
           `SELECT m.id, m.user_id, m.content, m.created_at, m.display_name, m.team_id, m.team_name, m.primary_color,
                   m.reply_to_id, m.reply_to_snippet, m.edited, m.deleted,
                   u.first_name, u.last_name, u.avatar_url
            FROM chat_messages m LEFT JOIN users u ON u.id = m.user_id
-           WHERE m.room_id = ?${beforeId ? " AND m.id < ?" : ""}
+           WHERE m.room_id = ? AND m.reply_to_id IS NULL${beforeId ? " AND m.id < ?" : ""}
            ORDER BY m.id DESC LIMIT ?`
         ).bind(...(beforeId ? [channelId, beforeId, limit] : [channelId, limit])).all();
         let reactionsByMsg = {};
+        let threadCounts = {};
         if (messages.length) {
           const ids = messages.map(m => m.id);
+          const placeholders = ids.map(() => "?").join(",");
           const { results: rows } = await env.DB.prepare(
-            `SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${ids.map(() => "?").join(",")})`
+            `SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${placeholders})`
           ).bind(...ids).all();
           for (const r of rows) {
             if (!reactionsByMsg[r.message_id]) reactionsByMsg[r.message_id] = {};
             if (!reactionsByMsg[r.message_id][r.emoji]) reactionsByMsg[r.message_id][r.emoji] = { count: 0, mine: false };
             reactionsByMsg[r.message_id][r.emoji].count++;
             if (r.user_id === session.userId) reactionsByMsg[r.message_id][r.emoji].mine = true;
+          }
+          const { results: counts } = await env.DB.prepare(
+            `SELECT reply_to_id, COUNT(*) AS c, MAX(created_at) AS last_at FROM chat_messages WHERE reply_to_id IN (${placeholders}) AND deleted = 0 GROUP BY reply_to_id`
+          ).bind(...ids).all();
+          for (const c of counts) {
+            threadCounts[c.reply_to_id] = { count: c.c, lastReplyAt: c.last_at };
           }
         }
         return json({
@@ -475,6 +484,8 @@ export async function handleApiRoutes(request, env, url, ctx) {
             edited: !!m.edited,
             replyToId: m.reply_to_id || null,
             replyToSnippet: m.reply_to_snippet || null,
+            replyCount: threadCounts[m.id]?.count || 0,
+            lastReplyAt: threadCounts[m.id]?.lastReplyAt || null,
             createdAt: m.created_at,
             reactions: m.deleted ? [] : Object.entries(reactionsByMsg[m.id] || {}).map(([emoji, d]) => ({ emoji, count: d.count, mine: d.mine })),
           })),
@@ -519,6 +530,51 @@ export async function handleApiRoutes(request, env, url, ctx) {
         ).bind(channelId, session.userId, content, displayName, msgTeamId, msgTeamName, msgColor, replyToId, replyToSnippet, now).run();
         return json({ id: result.meta.last_row_id, createdAt: now });
       }
+    }
+
+    // GET /channels/:channelId/thread/:msgId — parent + thread replies
+    const threadMatch = channelSuffix.match(/^(.+)\/thread\/(\d+)$/);
+    if (threadMatch && request.method === "GET") {
+      const channelId = threadMatch[1];
+      const parentId = parseInt(threadMatch[2]);
+      if (!await checkChannelAccess(env, session, channelId)) return err("Forbidden", "forbidden", 403);
+      const { results: rows } = await env.DB.prepare(
+        `SELECT m.id, m.user_id, m.content, m.created_at, m.display_name, m.team_id, m.team_name, m.primary_color,
+                m.reply_to_id, m.edited, m.deleted, u.first_name, u.last_name, u.avatar_url
+         FROM chat_messages m LEFT JOIN users u ON u.id = m.user_id
+         WHERE m.room_id = ? AND (m.id = ? OR m.reply_to_id = ?)
+         ORDER BY m.id ASC`
+      ).bind(channelId, parentId, parentId).all();
+      if (!rows.length) return err("Thread not found", "not_found", 404);
+      const ids = rows.map(m => m.id);
+      const placeholders = ids.map(() => "?").join(",");
+      const { results: rxRows } = await env.DB.prepare(
+        `SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${placeholders})`
+      ).bind(...ids).all();
+      const reactionsByMsg = {};
+      for (const r of rxRows) {
+        if (!reactionsByMsg[r.message_id]) reactionsByMsg[r.message_id] = {};
+        if (!reactionsByMsg[r.message_id][r.emoji]) reactionsByMsg[r.message_id][r.emoji] = { count: 0, mine: false };
+        reactionsByMsg[r.message_id][r.emoji].count++;
+        if (r.user_id === session.userId) reactionsByMsg[r.message_id][r.emoji].mine = true;
+      }
+      return json({
+        messages: rows.map(m => ({
+          id: m.id,
+          userId: m.user_id,
+          displayName: m.display_name || [m.first_name, m.last_name].filter(Boolean).join(" ") || "Unknown",
+          avatarUrl: m.avatar_url || null,
+          teamId: m.team_id || null,
+          teamName: m.team_name || null,
+          primaryColor: m.primary_color || null,
+          content: m.deleted ? null : m.content,
+          deleted: !!m.deleted,
+          edited: !!m.edited,
+          replyToId: m.reply_to_id || null,
+          createdAt: m.created_at,
+          reactions: m.deleted ? [] : Object.entries(reactionsByMsg[m.id] || {}).map(([emoji, d]) => ({ emoji, count: d.count, mine: d.mine })),
+        })),
+      });
     }
 
     // PATCH /channels/:channelId/messages/:msgId — edit
