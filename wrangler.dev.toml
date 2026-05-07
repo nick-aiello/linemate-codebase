@@ -1,0 +1,11 @@
+name = "linemate-app"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "LINEUP_KV"
+id = "5d1a754e8a684e038cdaf294c2b9024e"
+
+[[r2_buckets]]
+binding = "LOGO_BUCKET"
+bucket_name = "linemate-logos"

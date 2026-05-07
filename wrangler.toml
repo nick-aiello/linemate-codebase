@@ -1,0 +1,24 @@
+name = "linemate-app"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+
+[[routes]]
+pattern = "linemate-app.com/*"
+zone_name = "linemate-app.com"
+
+[[routes]]
+pattern = "www.linemate-app.com/*"
+zone_name = "linemate-app.com"
+
+[[kv_namespaces]]
+binding = "LINEUP_KV"
+id = "7c226e285e674c90bbe5ce068f47443c"
+
+[[r2_buckets]]
+binding = "LOGO_BUCKET"
+bucket_name = "linemate-logos"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "linemate-db"
+database_id = "fa09c627-8ad6-4a33-a6a5-116e9a668142"
