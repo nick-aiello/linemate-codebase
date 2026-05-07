@@ -556,16 +556,22 @@ export async function handleApiRoutes(request, env, url, ctx) {
           `INSERT INTO chat_messages (room_id, user_id, content, display_name, team_id, team_name, primary_color, reply_to_id, reply_to_snippet, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(channelId, session.userId, content, displayName, msgTeamId, msgTeamName, msgColor, replyToId, replyToSnippet, mentionsJson, now).run();
 
-        // Push notifications to mentioned users (excluding sender)
-        const recipients = mentions.filter(uid => uid && uid !== session.userId);
-        if (recipients.length) {
-          const channel = await env.DB.prepare(`SELECT name, type FROM chat_rooms WHERE id = ?`).bind(channelId).first();
-          const channelLabel = channel?.type === "dm" ? "DM" : "#" + (channel?.name || "channel");
-          await sendPushToUsers(env, recipients, {
-            title: `${displayName} in ${channelLabel}`,
-            body: content.slice(0, 140),
-            data: { channelId, messageId: result.meta.last_row_id, type: "mention" },
-          });
+        // Push notifications to mentioned users (excluding sender, respecting mentions pref)
+        const rawRecipients = mentions.filter(uid => uid && uid !== session.userId);
+        if (rawRecipients.length) {
+          const placeholders = rawRecipients.map(() => "?").join(",");
+          const optedOut = await env.DB.prepare(`SELECT user_id FROM notification_preferences WHERE team_id = ? AND mentions = 0 AND user_id IN (${placeholders})`).bind(msgTeamId, ...rawRecipients).all();
+          const optedOutSet = new Set((optedOut.results || []).map(r => r.user_id));
+          const recipients = rawRecipients.filter(uid => !optedOutSet.has(uid));
+          if (recipients.length) {
+            const channel = await env.DB.prepare(`SELECT name, type FROM chat_rooms WHERE id = ?`).bind(channelId).first();
+            const channelLabel = channel?.type === "dm" ? "DM" : "#" + (channel?.name || "channel");
+            await sendPushToUsers(env, recipients, {
+              title: `${displayName} in ${channelLabel}`,
+              body: content.slice(0, 140),
+              data: { channelId, messageId: result.meta.last_row_id, type: "mention" },
+            });
+          }
         }
         return json({ id: result.meta.last_row_id, createdAt: now });
       }
@@ -1083,15 +1089,15 @@ export async function handleApiRoutes(request, env, url, ctx) {
 
   if (teamPath === "/notifications" && request.method === "GET") {
     if (!env.DB) return err("Not available", "no_db", 503);
-    const prefs = await env.DB.prepare(`SELECT lineup_set, game_reminder, chat_messages FROM notification_preferences WHERE user_id = ? AND team_id = ?`).bind(session.userId, teamId).first();
-    return json({ lineupSet: prefs ? !!prefs.lineup_set : true, gameReminder: prefs ? !!prefs.game_reminder : true, chatMessages: prefs ? !!prefs.chat_messages : true });
+    const prefs = await env.DB.prepare(`SELECT lineup_set, game_reminder, chat_messages, mentions FROM notification_preferences WHERE user_id = ? AND team_id = ?`).bind(session.userId, teamId).first();
+    return json({ lineupSet: prefs ? !!prefs.lineup_set : true, gameReminder: prefs ? !!prefs.game_reminder : true, chatMessages: prefs ? !!prefs.chat_messages : true, mentions: prefs ? (prefs.mentions !== 0) : true });
   }
 
   if (teamPath === "/notifications" && request.method === "POST") {
     if (!env.DB) return err("Not available", "no_db", 503);
     let body;
     try { body = await request.json(); } catch(e) { return err("Invalid JSON", "invalid_json"); }
-    await env.DB.prepare(`INSERT INTO notification_preferences (user_id, team_id, lineup_set, game_reminder, chat_messages) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, team_id) DO UPDATE SET lineup_set=excluded.lineup_set, game_reminder=excluded.game_reminder, chat_messages=excluded.chat_messages`).bind(session.userId, teamId, body.lineupSet !== false ? 1 : 0, body.gameReminder !== false ? 1 : 0, body.chatMessages !== false ? 1 : 0).run();
+    await env.DB.prepare(`INSERT INTO notification_preferences (user_id, team_id, lineup_set, game_reminder, chat_messages, mentions) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, team_id) DO UPDATE SET lineup_set=excluded.lineup_set, game_reminder=excluded.game_reminder, chat_messages=excluded.chat_messages, mentions=excluded.mentions`).bind(session.userId, teamId, body.lineupSet !== false ? 1 : 0, body.gameReminder !== false ? 1 : 0, body.chatMessages !== false ? 1 : 0, body.mentions !== false ? 1 : 0).run();
     return json({ ok: true });
   }
 
@@ -1172,6 +1178,7 @@ export async function handleApiRoutes(request, env, url, ctx) {
       const profile = existing ? JSON.parse(existing) : {};
       if (body.email !== undefined) profile.email = body.email;
       if (body.phone !== undefined) profile.phone = body.phone;
+      if (body.preferredPosition !== undefined) profile.preferredPosition = body.preferredPosition || null;
       await env.LINEUP_KV.put(profileKey, JSON.stringify(profile));
       return json({ ok: true });
     }
